@@ -1,16 +1,15 @@
 # WiFi Sense Lab — Configuration
 # ================================
 # Shared settings for backend, scripts, and reference for firmware.
-# Firmware WiFi credentials are compiled into the .ino (see #define at top).
+# ESP32 WiFi credentials are now managed via the dashboard (serial commands).
 
 serial:
   port: "/dev/cu.usbserial-0001"
   baud_rate: 921600
-  timeout_seconds: 2
 
 wifi:
-  ssid: "YOUR_WIFI_SSID"
-  password: "YOUR_WIFI_PASSWORD"
+  scan_timeout: 15
+  connect_timeout: 20
 
 room:
   width: 4.0      # meters
@@ -22,8 +21,17 @@ csi:
 
 detection:
   presence_threshold: 3.0
-  movement_threshold: 5.0
   calibration_seconds: 30
+  movement_thresholds:
+    quiet: 5
+    light: 30
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
 
 plot:
   update_interval_ms: 100

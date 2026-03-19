@@ -2,7 +2,7 @@ numpy
 scipy
 pyserial
 fastapi
-uvicorn
+uvicorn[standard]
 python-socketio
 matplotlib
 pyyaml
