@@ -1,0 +1,30 @@
+# WiFi Sense Lab — Configuration
+# ================================
+# Shared settings for backend, scripts, and reference for firmware.
+# Firmware WiFi credentials are compiled into the .ino (see #define at top).
+
+serial:
+  port: "/dev/cu.usbserial-0001"
+  baud_rate: 921600
+  timeout_seconds: 2
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+
+room:
+  width: 4.0      # meters
+  length: 5.0     # meters
+
+csi:
+  num_subcarriers: 64   # ESP32 typically provides up to 64 subcarriers
+  sample_rate_hz: 100   # target CSI packets per second
+
+detection:
+  presence_threshold: 3.0
+  movement_threshold: 5.0
+  calibration_seconds: 30
+
+plot:
+  update_interval_ms: 100
+  max_history_seconds: 30

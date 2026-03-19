@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+.env
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+.turbo/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ESP32 / Arduino
+firmware/**/build/
+firmware/**/.build/
+
+# Data files
+*.csv
+*.log
+data/
+
+# Config overrides (keep settings.yaml, ignore local overrides)
+config/settings.local.yaml

@@ -1,0 +1,8 @@
+numpy
+scipy
+pyserial
+fastapi
+uvicorn
+python-socketio
+matplotlib
+pyyaml
