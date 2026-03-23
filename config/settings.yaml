@@ -20,21 +20,27 @@ csi:
   sample_rate_hz: 100   # target CSI packets per second
 
 detection:
-  threshold: 3.0
+  threshold: 1.2            # legacy fallback
+  threshold_multiplier: 1.4
   calibration_seconds: 30
   num_subcarriers: 64
-  sample_rate: 50
-  buffer_seconds: 10
+  sample_rate: 5
+  buffer_seconds: 30
+  mvs_window_seconds: 2
+  num_selected_subcarriers: 12
   movement_thresholds:
     quiet: 5
     light: 30
+  mac_filter: "auto"        # "auto" = use connected AP's BSSID, or specific MAC like "C4:93:BB:13:57:71"
 
 server:
   host: "0.0.0.0"
   port: 8000
   cors_origins:
     - "http://localhost:3000"
+    - "http://localhost:3002"
     - "http://127.0.0.1:3000"
+    - "http://127.0.0.1:3002"
 
 plot:
   update_interval_ms: 100

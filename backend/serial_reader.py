@@ -104,6 +104,10 @@ class SerialReader:
     def _route_line(self, line: str):
         """Route incoming serial line by prefix."""
         if line.startswith('CSI,'):
+            # Mark CSI as active when we receive actual CSI data
+            if not self.esp32_status['csi_active']:
+                self.esp32_status['csi_active'] = True
+                logger.info("CSI data stream detected — marking csi_active=True")
             if self.on_csi:
                 self.on_csi(line)
         elif line.startswith('AP,'):
@@ -124,16 +128,59 @@ class SerialReader:
 
     def _handle_response(self, line: str):
         """Handle RSP: responses -- resolve pending command."""
+        # Parse STATUS responses to sync esp32_status
+        # Format: RSP:STATUS,connected,ssid,ip,rssi,channel
+        if line.startswith('RSP:STATUS,connected,') and getattr(self, '_pending_status_query', False):
+            self._pending_status_query = False
+            parts = line.split(',')
+            if len(parts) >= 6:
+                self.esp32_status.update({
+                    'wifi_connected': True,
+                    'ssid': parts[2] if parts[2] else None,
+                    'ip': parts[3] if parts[3] else None,
+                    'rssi': int(parts[4]) if parts[4].lstrip('-').isdigit() else None,
+                    'channel': int(parts[5]) if parts[5].isdigit() else None,
+                })
+                logger.info(f"WiFi status synced: {parts[2]} @ {parts[3]}")
+
         with self._lock:
             self._response_data = line
             self._response_event.set()
 
     def _handle_heartbeat(self, line: str):
-        """Parse HB,timestamp,free_heap,wifi_status."""
+        """Parse HB,timestamp,free_heap,wifi_status.
+
+        When heartbeat reports 'connected' but we don't have ssid/ip,
+        query the ESP32 for full WiFi status to sync state.
+        """
         parts = line.split(',')
         if len(parts) >= 4:
             self.esp32_status['free_heap'] = int(parts[2]) if parts[2].isdigit() else 0
-            self.esp32_status['wifi_connected'] = parts[3] == 'connected'
+            is_connected = parts[3].strip() == 'connected'
+            was_connected = self.esp32_status['wifi_connected']
+            self.esp32_status['wifi_connected'] = is_connected
+
+            # If ESP32 reports connected but we don't have ssid, fetch status
+            if is_connected and not was_connected or (is_connected and not self.esp32_status.get('ssid')):
+                self._fetch_wifi_status()
+
+    def _fetch_wifi_status(self):
+        """Query ESP32 for WiFi status and update esp32_status.
+
+        Called from the read thread when heartbeat shows connected
+        but we're missing ssid/ip details.
+        """
+        if self.serial and self.serial.is_open:
+            try:
+                self.serial.write(b'CMD:WIFI_STATUS\n')
+                self.serial.flush()
+                # Response will arrive via _handle_response / _route_line
+                # and we parse it in the read loop. We just need to catch
+                # RSP:STATUS lines. Add a one-shot flag to parse next STATUS response.
+                self._pending_status_query = True
+                logger.info("Querying ESP32 WiFi status to sync state")
+            except Exception as e:
+                logger.error(f"Failed to query WiFi status: {e}")
 
     def send_command(self, cmd: str, timeout: float = 10.0) -> Optional[str]:
         """Send command and wait for RSP: response. Thread-safe."""
@@ -257,6 +304,31 @@ class SerialReader:
                 'channel': int(parts[4]) if len(parts) > 4 and parts[4] else None,
             }
         return {'connected': False}
+
+    def set_mac_filter(self, mac: str) -> dict:
+        """Set MAC filter on ESP32. Returns result dict.
+
+        Sends CMD:SET_MAC_FILTER,<mac> and waits for RSP:MAC_FILTER_OK
+        or RSP:MAC_FILTER_FAIL response.
+        """
+        mac = mac.strip().upper()
+        logger.info(f"Setting MAC filter: {mac}")
+        response = self.send_command(f"SET_MAC_FILTER,{mac}", timeout=5.0)
+
+        if response and 'MAC_FILTER_OK' in response:
+            # RSP:MAC_FILTER_OK,AA:BB:CC:DD:EE:FF
+            parts = response.split(',', 1)
+            filtered_mac = parts[1] if len(parts) > 1 else mac
+            logger.info(f"MAC filter set to: {filtered_mac}")
+            return {'success': True, 'mac': filtered_mac}
+        elif response and 'MAC_FILTER_FAIL' in response:
+            # RSP:MAC_FILTER_FAIL,reason
+            reason = response.split(',', 1)[1] if ',' in response else 'Unknown error'
+            logger.warning(f"MAC filter failed: {reason}")
+            return {'success': False, 'error': reason}
+        else:
+            logger.warning("MAC filter command timeout or no response")
+            return {'success': False, 'error': 'Command timeout'}
 
     def wifi_reset(self) -> bool:
         """Reset WiFi credentials on ESP32."""

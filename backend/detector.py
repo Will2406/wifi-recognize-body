@@ -21,12 +21,15 @@ class PresenceDetector:
     def __init__(self, threshold: float = 3.0, calibration_seconds: float = 30.0,
                  num_subcarriers: int = 64, sample_rate: float = 50.0,
                  buffer_seconds: int = 10,
-                 movement_thresholds: dict | None = None):
+                 movement_thresholds: dict | None = None,
+                 num_selected_subcarriers: int = 12,
+                 mvs_window_seconds: float = 2.0,
+                 threshold_multiplier: float = 1.4):
         """
         Parameters
         ----------
         threshold : float
-            Variance ratio above which presence is detected.
+            Variance ratio above which presence is detected (legacy fallback).
         calibration_seconds : float
             Duration of baseline calibration in seconds.
         num_subcarriers : int
@@ -37,9 +40,16 @@ class PresenceDetector:
             Ring buffer duration in seconds.
         movement_thresholds : dict, optional
             Keys 'quiet' and 'light' for movement classification boundaries.
+        num_selected_subcarriers : int
+            Number of subcarriers to select via NBVI during calibration.
+        mvs_window_seconds : float
+            Window length in seconds for moving variance computation.
+        threshold_multiplier : float
+            Multiplier applied to baseline_p95_mv for adaptive threshold.
         """
         self.threshold = threshold
         self.calibration_seconds = calibration_seconds
+        self.threshold_multiplier = threshold_multiplier
 
         # Core signal processor
         self.processor = SignalProcessor(
@@ -47,6 +57,8 @@ class PresenceDetector:
             sample_rate=sample_rate,
             buffer_seconds=buffer_seconds,
             movement_thresholds=movement_thresholds,
+            num_selected_subcarriers=num_selected_subcarriers,
+            mvs_window_seconds=mvs_window_seconds,
         )
 
         # Detection state
@@ -55,14 +67,24 @@ class PresenceDetector:
             'movement': 0.0,
             'movement_label': 'quiet',
             'variance_ratio': 0.0,
+            'spatial_turbulence': 0.0,
+            'moving_variance': 0.0,
+            'adaptive_threshold': None,
+            'baseline_p95_mv': None,
             'selected_subcarriers': [],
             'calibrated': False,
             'calibrating': False,
         }
 
         # Smoothing: keep last N detection results for temporal smoothing
-        self._history_size = 5
+        # At low packet rates, use larger history for stability
+        self._history_size = 10
         self._presence_history: list[bool] = []
+
+        # Hold-on timer: once presence is detected, keep it active
+        # for at least this many seconds (avoids flickering)
+        self._presence_hold_seconds = 5.0
+        self._last_presence_time: float = 0.0
 
         # Stats
         self._sample_count = 0
@@ -129,22 +151,30 @@ class PresenceDetector:
         # Get raw detection from processor
         result = self.processor.get_detection_result()
 
-        # Override presence with custom threshold
-        if self.processor.calibrated:
-            raw_presence = result['variance_ratio'] > self.threshold
+        # Presence via adaptive threshold on moving variance
+        if self.processor.calibrated and result.get('baseline_p95_mv') is not None:
+            baseline_p95_mv = result['baseline_p95_mv']
+            adaptive_threshold = baseline_p95_mv * self.threshold_multiplier
+            moving_variance = result.get('moving_variance', 0.0)
+            raw_presence = moving_variance > adaptive_threshold
+            result['adaptive_threshold'] = round(adaptive_threshold, 6)
         else:
             raw_presence = False
+            result['adaptive_threshold'] = None
 
         # Temporal smoothing on presence
         self._presence_history.append(raw_presence)
         if len(self._presence_history) > self._history_size:
             self._presence_history.pop(0)
 
-        # Majority vote
-        if len(self._presence_history) >= 3:
-            smoothed_presence = sum(self._presence_history) > len(self._presence_history) / 2
-        else:
-            smoothed_presence = raw_presence
+        # Presence if ANY recent detection was positive (sensitive)
+        # Plus hold-on timer to prevent flickering
+        if raw_presence:
+            self._last_presence_time = now
+
+        any_recent = any(self._presence_history[-3:]) if len(self._presence_history) >= 3 else raw_presence
+        held = (now - self._last_presence_time) < self._presence_hold_seconds
+        smoothed_presence = any_recent or held
 
         result['presence'] = smoothed_presence
         self._last_result = result
@@ -166,4 +196,5 @@ class PresenceDetector:
             **self._last_result,
             'sample_count': self._sample_count,
             'threshold': self.threshold,
+            'threshold_multiplier': self.threshold_multiplier,
         }

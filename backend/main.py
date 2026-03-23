@@ -66,6 +66,9 @@ detector = PresenceDetector(
     sample_rate=detection_config.get('sample_rate', 50.0),
     buffer_seconds=detection_config.get('buffer_seconds', 10),
     movement_thresholds=detection_config.get('movement_thresholds', {'quiet': 5, 'light': 30}),
+    num_selected_subcarriers=detection_config.get('num_selected_subcarriers', 12),
+    mvs_window_seconds=detection_config.get('mvs_window_seconds', 2.0),
+    threshold_multiplier=detection_config.get('threshold_multiplier', 1.4),
 )
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,9 @@ loop = None  # Will be set in lifespan
 # Throttle detection result emission to avoid flooding WebSocket
 _last_detection_emit: float = 0.0
 _DETECTION_EMIT_INTERVAL: float = 0.25  # seconds
+
+# MAC filter for defense-in-depth (firmware handles primary filtering)
+_mac_filter: str = detection_config.get('mac_filter', 'auto')
 
 
 def on_csi(line: str):
@@ -103,6 +109,11 @@ def on_csi(line: str):
         num_subcarriers = int(parts[5])
     except (ValueError, IndexError):
         return
+
+    # Defense-in-depth MAC filter (firmware handles primary filtering)
+    if _mac_filter and _mac_filter.lower() != 'auto':
+        if mac_src.upper() != _mac_filter.upper():
+            return
 
     # Parse I/Q pairs
     iq_values = parts[6:]
@@ -171,6 +182,10 @@ def on_csi(line: str):
                 'movement': detection_result.get('movement', 0.0),
                 'movement_label': detection_result.get('movement_label', 'quiet'),
                 'variance_ratio': detection_result.get('variance_ratio', 0.0),
+                'spatial_turbulence': detection_result.get('spatial_turbulence', 0.0),
+                'moving_variance': detection_result.get('moving_variance', 0.0),
+                'adaptive_threshold': detection_result.get('adaptive_threshold'),
+                'baseline_p95_mv': detection_result.get('baseline_p95_mv'),
                 'calibrated': detection_result.get('calibrated', False),
                 'calibrating': detection_result.get('calibrating', False),
             }
@@ -207,6 +222,15 @@ async def lifespan(app: FastAPI):
     logging.info(f"Connecting to ESP32 on {port}...")
     if reader.connect():
         logging.info("ESP32 serial connected!")
+        # Send MAC filter command if a specific MAC is configured
+        mac_filter_cfg = detection_config.get('mac_filter', 'auto')
+        if mac_filter_cfg and mac_filter_cfg.lower() != 'auto':
+            logging.info(f"Sending MAC filter to ESP32: {mac_filter_cfg}")
+            result = reader.set_mac_filter(mac_filter_cfg)
+            if result.get('success'):
+                logging.info(f"MAC filter active: {result.get('mac')}")
+            else:
+                logging.warning(f"MAC filter command failed: {result.get('error', 'unknown')}")
     else:
         logging.warning(f"ESP32 not found on {port} — will retry on API calls")
 
