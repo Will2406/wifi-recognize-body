@@ -1,11 +1,13 @@
 /*
- * WiFi Sense Lab — CSI Sensor Firmware v2.0
+ * WiFi Sense Lab — CSI Sensor Firmware v2.1
  * ==========================================
  * ESP32-WROOM-32 DevKit v1
  * Arduino ESP32 Core 3.x (ESP-IDF 5.x)
  *
  * Captures WiFi Channel State Information (CSI) and outputs
- * subcarrier amplitudes over serial in CSV format.
+ * raw I/Q (In-phase / Quadrature) pairs over serial in CSV format.
+ * This preserves both amplitude and phase information for the backend
+ * signal processing pipeline.
  *
  * Network-agnostic: works with ANY 2.4GHz WiFi access point.
  * Uses serial commands (CMD:/RSP: protocol) for network configuration —
@@ -22,7 +24,9 @@
  * Serial protocol:
  *   Commands IN:   CMD:WIFI_SCAN | CMD:WIFI_SET,ssid_b64,pass_b64 | CMD:WIFI_STATUS | CMD:WIFI_RESET
  *   Responses OUT: RSP:<response>
- *   CSI data:      CSI,<timestamp_ms>,<mac_src>,<rssi>,<channel>,<num_subcarriers>,<amp1>,<amp2>,...
+ *   CSI data:      CSI,<timestamp_ms>,<mac_src>,<rssi>,<channel>,<num_subcarriers>,<imag0>,<real0>,<imag1>,<real1>,...
+ *                  num_subcarriers = number of subcarrier PAIRS (N); total values after it = 2*N
+ *                  Each pair is (imaginary, real) as signed 8-bit integers.
  *   Heartbeat:     HB,<timestamp_ms>,<free_heap>,<wifi_status>
  *   Info:          INFO,<message>
  *   AP scan line:  AP,<index>,<ssid>,<mac>,<rssi>,<channel>
@@ -513,8 +517,7 @@ void wifi_csi_callback(void *ctx, wifi_csi_info_t *info) {
   for (int i = 0; i < num_subcarriers; i++) {
     int8_t imag = buf[i * 2];
     int8_t real = buf[i * 2 + 1];
-    int amplitude = (int)sqrtf((float)(real * real + imag * imag));
-    Serial.printf(",%d", amplitude);
+    Serial.printf(",%d,%d", (int)imag, (int)real);
   }
 
   Serial.println();
