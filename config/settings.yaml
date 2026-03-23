@@ -21,7 +21,7 @@ csi:
 
 detection:
   threshold: 1.2            # legacy fallback
-  threshold_multiplier: 1.1
+  threshold_multiplier: 2.0
   calibration_seconds: 15
   num_subcarriers: 64
   sample_rate: 5

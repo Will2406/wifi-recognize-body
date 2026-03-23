@@ -280,7 +280,11 @@ class SignalProcessor:
         return float(np.mean(live_var))
 
     def compute_spatial_turbulence(self, amplitudes: np.ndarray) -> float:
-        """Spatial turbulence = std of amplitudes across selected subcarriers.
+        """Spatial turbulence = CV (coefficient of variation) across selected subcarriers.
+
+        CV = std(amplitudes) / mean(amplitudes) — gain-invariant metric.
+        Eliminates false detections from AGC/FFT gain fluctuations without
+        needing firmware-level gain lock.
 
         Parameters
         ----------
@@ -290,31 +294,35 @@ class SignalProcessor:
         Returns
         -------
         float
-            Standard deviation of amplitude across selected subcarriers.
+            Coefficient of variation across selected subcarriers.
         """
         selected = self.select_subcarriers()
         if len(selected) == 0:
             return 0.0
-        return float(np.std(amplitudes[selected]))
+        sel_amps = amplitudes[selected]
+        mean_amp = np.mean(sel_amps)
+        if mean_amp < 1e-6:
+            return 0.0
+        return float(np.std(sel_amps) / mean_amp)
 
-    def compute_moving_variance(self, window_seconds: float | None = None) -> float:
-        """Moving variance of spatial turbulence over a recent window.
+    def compute_moving_variance(self, window_packets: int = 75) -> float:
+        """Moving variance of spatial turbulence over a packet-count window.
+
+        Packet-count-based (not time-based) so it adapts to actual packet rate.
+        Default 75 packets matches ESPectre's recommended window.
 
         Parameters
         ----------
-        window_seconds : float, optional
-            Window length in seconds. Defaults to ``self.mvs_window_seconds``.
+        window_packets : int
+            Number of recent packets to use. Defaults to 75.
 
         Returns
         -------
         float
             Variance of spatial turbulence over the window.
         """
-        if window_seconds is None:
-            window_seconds = self.mvs_window_seconds
-        window = int(self.sample_rate * window_seconds)
-        window = min(window, len(self.turbulence_buffer))
-        if window < 3:
+        window = min(window_packets, len(self.turbulence_buffer))
+        if window < 5:
             return 0.0
         recent = list(self.turbulence_buffer)[-window:]
         return float(np.var(recent))
@@ -479,11 +487,37 @@ class SignalProcessor:
         self.baseline_variance = np.var(data, axis=0)
 
         # Step 2: NBVI subcarrier selection — pick lowest scores (most stable)
+        # Exclude guard bands (< 6, > 58), DC subcarrier (32), and null subcarriers
         nbvi_scores = self._compute_nbvi(data)
-        n_select = min(self.num_selected_subcarriers, data.shape[1])
-        indices = np.argsort(nbvi_scores)[:n_select].tolist()
-        indices.sort()
-        self._selected_subcarriers = indices
+        mean_amps = np.mean(data, axis=0)
+        amp_threshold = np.percentile(mean_amps[mean_amps > 0], 25) if np.any(mean_amps > 0) else 0
+
+        # Build candidate list excluding guard/DC/weak subcarriers
+        candidates = []
+        for i in range(data.shape[1]):
+            if i < 6 or i > 58:  # guard bands
+                continue
+            if i == 32:  # DC subcarrier
+                continue
+            if mean_amps[i] < amp_threshold:  # noise gate: below 25th percentile
+                continue
+            candidates.append(i)
+
+        # Sort candidates by NBVI score (lowest = most stable)
+        candidates.sort(key=lambda i: nbvi_scores[i])
+
+        # Select top N with minimum spacing of 2 for spectral diversity
+        selected = []
+        for idx in candidates:
+            if len(selected) >= self.num_selected_subcarriers:
+                break
+            # Enforce minimum spacing
+            if any(abs(idx - s) < 2 for s in selected):
+                continue
+            selected.append(idx)
+
+        selected.sort()
+        self._selected_subcarriers = selected if selected else list(range(6, min(18, data.shape[1])))
         self._subcarriers_locked = True
 
         # Step 3: Compute spatial turbulence for each calibration sample
@@ -492,10 +526,10 @@ class SignalProcessor:
             cal_turbulence.append(self.compute_spatial_turbulence(row))
 
         # Step 4: Compute moving variances across the calibration turbulence
-        #         series and store P95 threshold
+        #         series and store P95 threshold (packet-count window = 75)
         cal_turbulence_arr = np.array(cal_turbulence)
-        mv_window = int(self.sample_rate * self.mvs_window_seconds)
-        mv_window = max(mv_window, 3)
+        mv_window = 75  # ESPectre default: 75 packets
+        mv_window = min(mv_window, max(len(cal_turbulence_arr) // 3, 5))
 
         moving_variances = []
         for i in range(mv_window, len(cal_turbulence_arr) + 1):
