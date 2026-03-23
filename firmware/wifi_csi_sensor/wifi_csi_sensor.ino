@@ -67,6 +67,10 @@ static unsigned long csi_packet_count = 0;
 static unsigned long last_stats_print = 0;
 static unsigned long last_heartbeat = 0;
 
+// MAC filter for CSI — only accept frames from this MAC
+static uint8_t filter_mac[6] = {0};
+static bool mac_filter_active = false;
+
 // ============================================================
 // FORWARD DECLARATIONS
 // ============================================================
@@ -79,12 +83,15 @@ void cmd_wifi_scan();
 void cmd_wifi_set(String args);
 void cmd_wifi_status();
 void cmd_wifi_reset();
+void cmd_set_mac_filter(String args);
 int  base64_decode(const char *input, char *output, int max_len);
 void register_csi();
 void wifi_csi_callback(void *ctx, wifi_csi_info_t *info);
 void update_led();
 void print_mac(const uint8_t *mac, char *buf);
 bool check_reset_button();
+void load_mac_filter();
+void save_mac_filter();
 
 // ============================================================
 // BASE64 DECODER
@@ -156,8 +163,9 @@ void setup() {
     Serial.println("INFO,WiFi credentials cleared by user");
   }
 
-  // Load saved credentials
+  // Load saved credentials and MAC filter
   load_credentials();
+  load_mac_filter();
 
   if (saved_ssid.length() > 0) {
     Serial.printf("INFO,Saved network: %s\n", saved_ssid.c_str());
@@ -175,6 +183,12 @@ void setup() {
       print_mac(WiFi.BSSID(), bssid_str);
       Serial.printf("INFO,BSSID: %s\n", bssid_str);
 
+      // Auto-set MAC filter to connected AP's BSSID
+      memcpy(filter_mac, WiFi.BSSID(), 6);
+      mac_filter_active = true;
+      save_mac_filter();
+      Serial.printf("INFO,MAC filter auto-set to BSSID: %s\n", bssid_str);
+
       // Register CSI
       register_csi();
     } else {
@@ -185,7 +199,7 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println("INFO,Ready for commands (CMD:WIFI_SCAN, CMD:WIFI_SET, CMD:WIFI_STATUS, CMD:WIFI_RESET)");
+  Serial.println("INFO,Ready for commands (CMD:WIFI_SCAN, CMD:WIFI_SET, CMD:WIFI_STATUS, CMD:WIFI_RESET, CMD:SET_MAC_FILTER)");
   Serial.println();
 
   last_stats_print = millis();
@@ -217,6 +231,15 @@ void loop() {
       if (connect_wifi(saved_ssid, saved_pass)) {
         Serial.println("INFO,WiFi reconnected!");
         wifi_connected = true;
+
+        // Auto-set MAC filter to reconnected AP's BSSID
+        memcpy(filter_mac, WiFi.BSSID(), 6);
+        mac_filter_active = true;
+        save_mac_filter();
+        char bssid_str[18];
+        print_mac(filter_mac, bssid_str);
+        Serial.printf("INFO,MAC filter auto-set to BSSID: %s\n", bssid_str);
+
         register_csi();
       }
     }
@@ -256,6 +279,8 @@ void process_command(String cmd) {
     cmd_wifi_status();
   } else if (cmd == "WIFI_RESET") {
     cmd_wifi_reset();
+  } else if (cmd.startsWith("SET_MAC_FILTER,")) {
+    cmd_set_mac_filter(cmd.substring(15));
   } else {
     Serial.printf("RSP:ERROR,Unknown command: %s\n", cmd.c_str());
   }
@@ -336,6 +361,12 @@ void cmd_wifi_set(String args) {
                   WiFi.channel(),
                   bssid_str);
 
+    // Auto-set MAC filter to connected AP's BSSID
+    memcpy(filter_mac, WiFi.BSSID(), 6);
+    mac_filter_active = true;
+    save_mac_filter();
+    Serial.printf("INFO,MAC filter auto-set to BSSID: %s\n", bssid_str);
+
     // Start CSI capture
     register_csi();
   } else {
@@ -376,6 +407,38 @@ void cmd_wifi_reset() {
 }
 
 // ============================================================
+// CMD: SET_MAC_FILTER  (args = "AA:BB:CC:DD:EE:FF")
+// ============================================================
+void cmd_set_mac_filter(String args) {
+  args.trim();
+
+  // Validate format: AA:BB:CC:DD:EE:FF (17 chars)
+  if (args.length() != 17) {
+    Serial.println("RSP:MAC_FILTER_FAIL,Invalid MAC format");
+    return;
+  }
+
+  uint8_t parsed_mac[6];
+  int matched = sscanf(args.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                        &parsed_mac[0], &parsed_mac[1], &parsed_mac[2],
+                        &parsed_mac[3], &parsed_mac[4], &parsed_mac[5]);
+
+  if (matched != 6) {
+    Serial.println("RSP:MAC_FILTER_FAIL,Invalid MAC format");
+    return;
+  }
+
+  memcpy(filter_mac, parsed_mac, 6);
+  mac_filter_active = true;
+  save_mac_filter();
+
+  char mac_str[18];
+  print_mac(filter_mac, mac_str);
+  Serial.printf("RSP:MAC_FILTER_OK,%s\n", mac_str);
+  Serial.printf("INFO,MAC filter set to: %s\n", mac_str);
+}
+
+// ============================================================
 // CREDENTIALS (NVS / Preferences)
 // ============================================================
 void load_credentials() {
@@ -400,6 +463,33 @@ void clear_credentials() {
   prefs.end();
   saved_ssid = "";
   saved_pass = "";
+}
+
+// ============================================================
+// MAC FILTER (NVS / Preferences)
+// ============================================================
+void load_mac_filter() {
+  prefs.begin("csifilter", true);  // read-only
+  bool saved = prefs.getBool("active", false);
+  if (saved) {
+    size_t len = prefs.getBytes("mac", filter_mac, 6);
+    if (len == 6) {
+      mac_filter_active = true;
+      char mac_str[18];
+      print_mac(filter_mac, mac_str);
+      Serial.printf("INFO,Loaded MAC filter from NVS: %s\n", mac_str);
+    } else {
+      mac_filter_active = false;
+    }
+  }
+  prefs.end();
+}
+
+void save_mac_filter() {
+  prefs.begin("csifilter", false);
+  prefs.putBytes("mac", filter_mac, 6);
+  prefs.putBool("active", mac_filter_active);
+  prefs.end();
 }
 
 // ============================================================
@@ -459,9 +549,33 @@ bool connect_wifi(String ssid, String pass) {
 // ============================================================
 // CSI CALLBACK REGISTRATION
 // ============================================================
+// Promiscuous mode RX callback (required for CSI on ESP-IDF 5.x)
+static void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+  // We don't need to process packets here — CSI callback handles the data.
+  // This just enables the promiscuous packet flow that triggers CSI.
+}
+
 void register_csi() {
   if (csi_registered) return;
 
+  esp_err_t err;
+
+  // Enable promiscuous mode — required for CSI capture on ESP-IDF 5.x
+  err = esp_wifi_set_promiscuous(true);
+  if (err != ESP_OK) {
+    Serial.printf("INFO,ERROR: esp_wifi_set_promiscuous failed: %s\n", esp_err_to_name(err));
+    return;
+  }
+  esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+
+  // Filter: only management and data frames (not control frames)
+  wifi_promiscuous_filter_t filt;
+  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  esp_wifi_set_promiscuous_filter(&filt);
+
+  Serial.println("INFO,Promiscuous mode enabled");
+
+  // CSI configuration
   wifi_csi_config_t csi_config;
   csi_config.lltf_en = true;
   csi_config.htltf_en = true;
@@ -469,8 +583,6 @@ void register_csi() {
   csi_config.ltf_merge_en = true;
   csi_config.channel_filter_en = false;
   csi_config.manu_scale = false;
-
-  esp_err_t err;
 
   err = esp_wifi_set_csi(true);
   if (err != ESP_OK) {
@@ -499,6 +611,13 @@ void register_csi() {
 // ============================================================
 void wifi_csi_callback(void *ctx, wifi_csi_info_t *info) {
   if (!info || !info->buf) return;
+
+  // MAC filter: drop frames not matching the target MAC
+  if (mac_filter_active) {
+    if (memcmp(info->mac, filter_mac, 6) != 0) {
+      return;  // Drop non-matching MAC
+    }
+  }
 
   unsigned long timestamp = millis();
   int rssi = info->rx_ctrl.rssi;
