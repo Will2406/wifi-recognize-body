@@ -306,10 +306,14 @@ class SignalProcessor:
         return float(np.std(sel_amps) / mean_amp)
 
     def compute_moving_variance(self, window_packets: int = 75) -> float:
-        """Moving variance of spatial turbulence over a packet-count window.
+        """Per-subcarrier temporal variance ratio over recent window.
 
-        Packet-count-based (not time-based) so it adapts to actual packet rate.
-        Default 75 packets matches ESPectre's recommended window.
+        Computes mean amplitude variance across NBVI-selected subcarriers
+        over the last N packets, divided by baseline variance.
+        This captures how much each subcarrier's amplitude fluctuates
+        due to human movement vs. the empty-room baseline.
+
+        Returns ratio > 1 when someone is present (amplitudes fluctuate more).
 
         Parameters
         ----------
@@ -319,13 +323,27 @@ class SignalProcessor:
         Returns
         -------
         float
-            Variance of spatial turbulence over the window.
+            Mean variance ratio across selected subcarriers. >1 = movement.
         """
-        window = min(window_packets, len(self.turbulence_buffer))
-        if window < 5:
+        window = min(window_packets, len(self.amplitude_buffer))
+        if window < 10:
             return 0.0
-        recent = list(self.turbulence_buffer)[-window:]
-        return float(np.var(recent))
+
+        selected = self.select_subcarriers()
+        if not selected:
+            return 0.0
+
+        # Stack recent amplitudes [window x subcarriers]
+        recent = np.array(list(self.amplitude_buffer)[-window:])
+        live_var = np.var(recent[:, selected], axis=0)
+
+        if self.baseline_variance is not None and self.calibrated:
+            baseline_sel = self.baseline_variance[selected]
+            safe_baseline = np.where(baseline_sel > 1e-10, baseline_sel, 1e-10)
+            ratios = live_var / safe_baseline
+            return float(np.mean(ratios))
+
+        return float(np.mean(live_var))
 
     def compute_doppler(self, window_seconds: float = 2.0) -> np.ndarray:
         """Compute Doppler spectrum via STFT on phase differences.
@@ -525,21 +543,27 @@ class SignalProcessor:
         for row in data:
             cal_turbulence.append(self.compute_spatial_turbulence(row))
 
-        # Step 4: Compute moving variances across the calibration turbulence
-        #         series and store P95 threshold (packet-count window = 75)
-        cal_turbulence_arr = np.array(cal_turbulence)
-        mv_window = 75  # ESPectre default: 75 packets
-        mv_window = min(mv_window, max(len(cal_turbulence_arr) // 3, 5))
+        # Step 4: Compute per-subcarrier variance ratios over sliding windows
+        #         to establish P95 baseline for the detection metric
+        window = 75
+        window = min(window, max(len(data) // 3, 10))
+        selected = self._selected_subcarriers or list(range(12))
 
-        moving_variances = []
-        for i in range(mv_window, len(cal_turbulence_arr) + 1):
-            segment = cal_turbulence_arr[i - mv_window:i]
-            moving_variances.append(float(np.var(segment)))
+        variance_ratios = []
+        safe_baseline = np.where(
+            self.baseline_variance[selected] > 1e-10,
+            self.baseline_variance[selected], 1e-10
+        )
+        for i in range(window, len(data) + 1):
+            segment = data[i - window:i, :][:, selected]
+            live_var = np.var(segment, axis=0)
+            ratios = live_var / safe_baseline
+            variance_ratios.append(float(np.mean(ratios)))
 
-        if len(moving_variances) > 0:
-            self.baseline_p95_mv = float(np.percentile(moving_variances, 95))
+        if len(variance_ratios) > 0:
+            self.baseline_p95_mv = float(np.percentile(variance_ratios, 95))
         else:
-            self.baseline_p95_mv = 0.0
+            self.baseline_p95_mv = 1.0  # fallback: ratio of 1.0 = no change
 
         self.calibrating = False
         self.calibrated = True

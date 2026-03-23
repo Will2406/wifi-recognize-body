@@ -87,14 +87,17 @@ loop = None  # Will be set in lifespan
 _last_detection_emit: float = 0.0
 _DETECTION_EMIT_INTERVAL: float = 0.25  # seconds
 
-# MAC filter for defense-in-depth (firmware handles primary filtering)
-_mac_filter: str = detection_config.get('mac_filter', 'auto')
+# MAC filter — auto-lock to most active MAC for consistent CSI
+_mac_filter_cfg: str = detection_config.get('mac_filter', 'auto')
+_mac_counts: dict = {}  # {mac: count} for auto-detection
+_locked_mac: str | None = None
+_mac_lock_threshold: int = 50  # Lock to MAC after 50 packets
 
 
 def on_csi(line: str):
     """Parse CSI line with raw I/Q pairs, compute amplitude/phase,
     feed into detector, and broadcast via Socket.IO."""
-    global _last_detection_emit
+    global _last_detection_emit, _locked_mac
 
     parts = line.split(',')
     # New format: CSI,ts,mac,rssi,ch,num_sub,imag0,real0,imag1,real1,...
@@ -110,10 +113,27 @@ def on_csi(line: str):
     except (ValueError, IndexError):
         return
 
-    # Defense-in-depth MAC filter (firmware handles primary filtering)
-    if _mac_filter and _mac_filter.lower() != 'auto':
-        if mac_src.upper() != _mac_filter.upper():
+    # MAC filtering: use only ONE consistent MAC source
+    if _mac_filter_cfg and _mac_filter_cfg.lower() != 'auto':
+        # Specific MAC configured
+        if mac_src.upper() != _mac_filter_cfg.upper():
             return
+    else:
+        # Auto-mode: lock to the most active MAC
+        _mac_counts[mac_src] = _mac_counts.get(mac_src, 0) + 1
+
+        if _locked_mac is None:
+            # Not locked yet — find most active MAC after threshold
+            total = sum(_mac_counts.values())
+            if total >= _mac_lock_threshold:
+                _locked_mac = max(_mac_counts, key=_mac_counts.get)
+                logging.info(f"Auto-locked to MAC: {_locked_mac} "
+                             f"({_mac_counts[_locked_mac]}/{total} packets)")
+            else:
+                return  # Don't process until we lock
+
+        if mac_src != _locked_mac:
+            return  # Only process locked MAC
 
     # Parse I/Q pairs
     iq_values = parts[6:]
