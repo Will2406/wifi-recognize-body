@@ -38,6 +38,7 @@
 #include <Preferences.h>
 #include "esp_wifi.h"
 #include <math.h>
+#include <lwip/sockets.h>
 
 // ============================================================
 // SETTINGS
@@ -51,6 +52,7 @@
 #define LED_SLOW_MS           1000      // Slow blink: capturing CSI
 #define LED_MEDIUM_MS         500       // Medium blink: connecting
 #define HEARTBEAT_INTERVAL_MS 5000     // Heartbeat every 5 seconds
+#define PING_INTERVAL_MS      20       // Ping every 20ms = 50 Hz CSI target
 
 // ============================================================
 // GLOBALS
@@ -66,6 +68,9 @@ static bool led_state = false;
 static unsigned long csi_packet_count = 0;
 static unsigned long last_stats_print = 0;
 static unsigned long last_heartbeat = 0;
+static unsigned long last_ping = 0;
+static bool ping_active = true;       // Traffic generator enabled by default
+static IPAddress gateway_ip;
 
 // MAC filter for CSI — only accept frames from this MAC
 static uint8_t filter_mac[6] = {0};
@@ -183,11 +188,11 @@ void setup() {
       print_mac(WiFi.BSSID(), bssid_str);
       Serial.printf("INFO,BSSID: %s\n", bssid_str);
 
-      // Auto-set MAC filter to connected AP's BSSID
-      memcpy(filter_mac, WiFi.BSSID(), 6);
-      mac_filter_active = true;
-      save_mac_filter();
-      Serial.printf("INFO,MAC filter auto-set to BSSID: %s\n", bssid_str);
+      // Capture gateway IP for ping traffic generator
+      gateway_ip = WiFi.gatewayIP();
+      Serial.printf("INFO,Gateway: %s\n", gateway_ip.toString().c_str());
+      Serial.printf("INFO,Connected BSSID: %s (MAC filter: %s)\n",
+                    bssid_str, mac_filter_active ? "active" : "off");
 
       // Register CSI
       register_csi();
@@ -263,8 +268,27 @@ void loop() {
     last_heartbeat = now;
   }
 
+  // Traffic generator: ping gateway to generate CSI data
+  if (ping_active && wifi_connected && (now - last_ping >= PING_INTERVAL_MS)) {
+    last_ping = now;
+    // Send a single UDP packet to gateway (lightweight, generates CSI response)
+    // Using raw lwIP socket for minimal overhead
+    static int sock_fd = -1;
+    if (sock_fd < 0) {
+      sock_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    }
+    if (sock_fd >= 0) {
+      struct sockaddr_in dest;
+      dest.sin_family = AF_INET;
+      dest.sin_port = htons(55555);  // arbitrary port
+      dest.sin_addr.s_addr = (uint32_t)gateway_ip;
+      uint8_t dummy = 0x42;
+      sendto(sock_fd, &dummy, 1, MSG_DONTWAIT, (struct sockaddr*)&dest, sizeof(dest));
+    }
+  }
+
   update_led();
-  delay(10);
+  delay(1);  // Reduced from 10ms to 1ms for higher ping rate
 }
 
 // ============================================================
@@ -281,6 +305,12 @@ void process_command(String cmd) {
     cmd_wifi_reset();
   } else if (cmd.startsWith("SET_MAC_FILTER,")) {
     cmd_set_mac_filter(cmd.substring(15));
+  } else if (cmd == "DISABLE_MAC_FILTER") {
+    mac_filter_active = false;
+    memset(filter_mac, 0, 6);
+    save_mac_filter();
+    Serial.println("RSP:MAC_FILTER_DISABLED");
+    Serial.println("INFO,MAC filter disabled — accepting all CSI");
   } else {
     Serial.printf("RSP:ERROR,Unknown command: %s\n", cmd.c_str());
   }
