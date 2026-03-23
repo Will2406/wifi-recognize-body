@@ -5,11 +5,13 @@ DSP pipeline for CSI data:
 - Ring buffers for amplitude and phase history
 - Phase unwrapping and sanitisation (linear slope & offset removal)
 - Hampel outlier removal (MAD-based)
-- Butterworth bandpass filter (0.5-25 Hz)
-- Subcarrier selection by temporal variance
+- NBVI-based subcarrier selection (locked at calibration time)
+- Spatial turbulence metric (cross-subcarrier std)
+- Moving variance of turbulence for presence detection
+- P95 adaptive threshold from calibration baseline
 - Doppler spectrum via STFT on phase differences
-- Variance ratio for presence detection
-- Movement level from Doppler energy
+- Variance ratio retained for backward compatibility
+- Butterworth bandpass retained as utility (not used in detection path)
 """
 
 import numpy as np
@@ -24,7 +26,9 @@ logger = logging.getLogger(__name__)
 class SignalProcessor:
     def __init__(self, num_subcarriers: int = 64, sample_rate: float = 50.0,
                  buffer_seconds: int = 10,
-                 movement_thresholds: dict | None = None):
+                 movement_thresholds: dict | None = None,
+                 num_selected_subcarriers: int = 12,
+                 mvs_window_seconds: float = 2.0):
         """
         Parameters
         ----------
@@ -37,10 +41,16 @@ class SignalProcessor:
         movement_thresholds : dict, optional
             Keys 'quiet' and 'light' with numeric thresholds for movement
             classification. Defaults to {'quiet': 5, 'light': 30}.
+        num_selected_subcarriers : int
+            Number of subcarriers to select via NBVI during calibration.
+        mvs_window_seconds : float
+            Window length in seconds for moving variance computation.
         """
         self.num_subcarriers = num_subcarriers
         self.sample_rate = sample_rate
         self.buffer_size = int(sample_rate * buffer_seconds)
+        self.num_selected_subcarriers = num_selected_subcarriers
+        self.mvs_window_seconds = mvs_window_seconds
 
         # Movement classification thresholds
         if movement_thresholds is None:
@@ -53,11 +63,16 @@ class SignalProcessor:
         self.phase_buffer: deque = deque(maxlen=self.buffer_size)
         self.timestamp_buffer: deque = deque(maxlen=self.buffer_size)
 
+        # Spatial turbulence buffer (Task 3.2)
+        self.turbulence_buffer: deque = deque(maxlen=self.buffer_size)
+
         # Baseline (set during calibration)
         self.baseline_variance: np.ndarray | None = None  # per-subcarrier
+        self.baseline_p95_mv: float | None = None  # P95 moving variance threshold
 
-        # Selected subcarrier indices
+        # Selected subcarrier indices (locked after calibration via NBVI)
         self._selected_subcarriers: list[int] | None = None
+        self._subcarriers_locked: bool = False
 
         # Sample counter for periodic recomputation
         self._sample_count: int = 0
@@ -100,6 +115,10 @@ class SignalProcessor:
         self.phase_buffer.append(phase_arr)
         self.timestamp_buffer.append(timestamp)
         self._sample_count += 1
+
+        # Compute and store spatial turbulence (Task 3.2)
+        turbulence = self.compute_spatial_turbulence(amp_arr)
+        self.turbulence_buffer.append(turbulence)
 
         # Calibration collection
         if self.calibrating:
@@ -148,8 +167,8 @@ class SignalProcessor:
 
         return filtered
 
-    def butterworth_bandpass(self, data: np.ndarray, lowcut: float = 0.5,
-                             highcut: float = 25.0,
+    def butterworth_bandpass(self, data: np.ndarray, lowcut: float = 0.1,
+                             highcut: float = None,
                              order: int = 4) -> np.ndarray:
         """Apply a Butterworth bandpass filter to a 1-D signal.
 
@@ -168,6 +187,8 @@ class SignalProcessor:
             Filtered signal (same length).
         """
         nyq = 0.5 * self.sample_rate
+        if highcut is None:
+            highcut = nyq * 0.8  # 80% of Nyquist
         low = lowcut / nyq
         high = highcut / nyq
 
@@ -220,30 +241,28 @@ class SignalProcessor:
     def compute_variance_ratio(self) -> float:
         """Compute variance ratio for presence detection.
 
-        Applies Hampel filter and Butterworth bandpass to amplitude data
-        before computing variance. This removes outliers and band-limits
-        the signal to the frequencies of interest (human movement).
+        Uses a recent sliding window of raw amplitudes (Hampel-filtered only)
+        compared against the baseline variance. No Butterworth at low sample
+        rates — it removes the signal we need.
 
         R = mean(sigma2_live / sigma2_baseline) over selected subcarriers.
 
         Returns 0.0 if not calibrated or insufficient data.
         """
-        if len(self.amplitude_buffer) < 20:
+        # Use last ~10 seconds of data for responsive detection
+        window = min(len(self.amplitude_buffer), int(self.sample_rate * 10))
+        if window < 5:
             return 0.0
 
-        # Stack buffer to matrix [samples x subcarriers]
-        amp_matrix = np.array(list(self.amplitude_buffer))
+        # Stack recent buffer to matrix [samples x subcarriers]
+        recent = list(self.amplitude_buffer)[-window:]
+        amp_matrix = np.array(recent)
 
-        # Apply Hampel filter per subcarrier column
+        # Apply Hampel filter per subcarrier (outlier removal only)
         for i in range(amp_matrix.shape[1]):
-            amp_matrix[:, i] = self.hampel_filter(amp_matrix[:, i])
+            amp_matrix[:, i] = self.hampel_filter(amp_matrix[:, i], window_size=3)
 
-        # Apply Butterworth bandpass per subcarrier (need minimum samples)
-        if amp_matrix.shape[0] >= 13:  # minimum for 4th order filter
-            for i in range(amp_matrix.shape[1]):
-                amp_matrix[:, i] = self.butterworth_bandpass(amp_matrix[:, i])
-
-        # Compute variance
+        # Compute variance over the recent window
         live_var = np.var(amp_matrix, axis=0)
 
         if self.baseline_variance is not None and self.calibrated:
@@ -259,6 +278,46 @@ class SignalProcessor:
             return float(np.mean(ratios[selected]))
 
         return float(np.mean(live_var))
+
+    def compute_spatial_turbulence(self, amplitudes: np.ndarray) -> float:
+        """Spatial turbulence = std of amplitudes across selected subcarriers.
+
+        Parameters
+        ----------
+        amplitudes : np.ndarray
+            1-D array of amplitude values for a single CSI sample.
+
+        Returns
+        -------
+        float
+            Standard deviation of amplitude across selected subcarriers.
+        """
+        selected = self.select_subcarriers()
+        if len(selected) == 0:
+            return 0.0
+        return float(np.std(amplitudes[selected]))
+
+    def compute_moving_variance(self, window_seconds: float | None = None) -> float:
+        """Moving variance of spatial turbulence over a recent window.
+
+        Parameters
+        ----------
+        window_seconds : float, optional
+            Window length in seconds. Defaults to ``self.mvs_window_seconds``.
+
+        Returns
+        -------
+        float
+            Variance of spatial turbulence over the window.
+        """
+        if window_seconds is None:
+            window_seconds = self.mvs_window_seconds
+        window = int(self.sample_rate * window_seconds)
+        window = min(window, len(self.turbulence_buffer))
+        if window < 3:
+            return 0.0
+        recent = list(self.turbulence_buffer)[-window:]
+        return float(np.var(recent))
 
     def compute_doppler(self, window_seconds: float = 2.0) -> np.ndarray:
         """Compute Doppler spectrum via STFT on phase differences.
@@ -313,53 +372,66 @@ class SignalProcessor:
         return avg_spectrum
 
     def compute_movement_level(self) -> float:
-        """Compute movement level from Doppler energy.
+        """Compute movement level from variance ratio relative to baseline.
 
-        M = energy_nonzero_doppler / total_energy * 100
+        Uses the variance ratio directly as a movement indicator:
+        - ratio ~1.0 = no movement (same as baseline)
+        - ratio > 1.0 = movement detected
+        - Scaled to 0-100 range where 100 = very strong movement
 
-        Returns 0.0 if no Doppler data.
+        Returns 0.0 if not calibrated or insufficient data.
         """
-        spectrum = self.compute_doppler()
-        if len(spectrum) < 3:
+        if not self.calibrated:
             return 0.0
 
-        total_energy = np.sum(spectrum)
-        if total_energy < 1e-12:
+        ratio = self.compute_variance_ratio()
+        if ratio <= 0:
             return 0.0
 
-        # Skip DC bin (index 0) -- non-zero Doppler is everything else
-        nonzero_energy = np.sum(spectrum[1:])
-        movement = (nonzero_energy / total_energy) * 100.0
+        # Scale: ratio of 1.0 = 0%, ratio of 5.0+ = 100%
+        # Subtract 1.0 (baseline), then scale by 25 to get percentage
+        movement = max(0.0, (ratio - 1.0)) * 25.0
         return float(np.clip(movement, 0.0, 100.0))
 
-    def select_subcarriers(self, top_n: int = 15) -> list[int]:
-        """Select most sensitive subcarriers by temporal variance.
+    def select_subcarriers(self) -> list[int]:
+        """Return NBVI-selected subcarriers (locked after calibration).
 
-        Caches the result and only recomputes every ~100 samples.
+        After calibration, returns the subcarriers with the lowest NBVI
+        scores (most stable). Before calibration, falls back to the first
+        ``num_selected_subcarriers`` subcarriers.
 
         Returns
         -------
         list[int]
-            Indices of the top-N subcarriers.
+            Indices of the selected subcarriers.
         """
-        # Recompute periodically
-        buf_len = len(self.amplitude_buffer)
-        if (self._selected_subcarriers is not None
-                and buf_len % 100 != 0
-                and buf_len > 0):
+        if self._subcarriers_locked and self._selected_subcarriers is not None:
             return self._selected_subcarriers
 
-        if buf_len < 20:
-            self._selected_subcarriers = list(range(min(top_n, self.num_subcarriers)))
-            return self._selected_subcarriers
+        # Fallback: first N subcarriers if not yet calibrated
+        n = min(self.num_selected_subcarriers, self.num_subcarriers)
+        return list(range(n))
 
-        data = np.array(list(self.amplitude_buffer))  # (T, N)
-        variance = np.var(data, axis=0)
-        n = min(top_n, data.shape[1])
-        indices = np.argsort(variance)[-n:].tolist()
-        indices.sort()
-        self._selected_subcarriers = indices
-        return self._selected_subcarriers
+    def _compute_nbvi(self, data: np.ndarray) -> np.ndarray:
+        """Compute Narrowband Variance Index per subcarrier.
+
+        NBVI = 0.3*(sigma/mu^2) + 0.7*(sigma/mu). Lower = more stable.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            2-D array of shape (samples, subcarriers).
+
+        Returns
+        -------
+        np.ndarray
+            1-D array of NBVI scores per subcarrier.
+        """
+        mu = np.mean(data, axis=0)
+        sigma = np.std(data, axis=0)
+        safe_mu = np.where(np.abs(mu) > 1e-6, mu, 1e-6)
+        nbvi = 0.3 * (sigma / (safe_mu ** 2)) + 0.7 * (sigma / np.abs(safe_mu))
+        return nbvi
 
     # ------------------------------------------------------------------
     # Calibration
@@ -375,24 +447,74 @@ class SignalProcessor:
         self.calibrating = True
         self.calibrated = False
         self.baseline_variance = None
+        self.baseline_p95_mv = None
+        self._selected_subcarriers = None
+        self._subcarriers_locked = False
         self._calibration_start = time.time()
         self._calibration_seconds = seconds
         self._calibration_amplitudes = []
 
     def _finish_calibration(self):
-        """Compute baseline variance from collected calibration data."""
+        """Compute baseline from collected calibration data.
+
+        Steps:
+        1. Hampel-filter calibration amplitudes (outlier removal).
+        2. Compute per-subcarrier baseline variance.
+        3. Compute NBVI and lock the best subcarriers (Task 3.1).
+        4. Compute spatial turbulence per calibration sample (Task 3.4).
+        5. Compute moving variances and store P95 threshold (Task 3.4).
+        """
         if len(self._calibration_amplitudes) < 10:
             logger.warning("Calibration failed: not enough samples collected")
             self.calibrating = False
             return
 
         data = np.array(self._calibration_amplitudes)  # (T, N)
+
+        # Apply same Hampel filter used in live detection
+        for i in range(data.shape[1]):
+            data[:, i] = self.hampel_filter(data[:, i], window_size=3)
+
+        # Step 1: Baseline variance (backward compat)
         self.baseline_variance = np.var(data, axis=0)
+
+        # Step 2: NBVI subcarrier selection — pick lowest scores (most stable)
+        nbvi_scores = self._compute_nbvi(data)
+        n_select = min(self.num_selected_subcarriers, data.shape[1])
+        indices = np.argsort(nbvi_scores)[:n_select].tolist()
+        indices.sort()
+        self._selected_subcarriers = indices
+        self._subcarriers_locked = True
+
+        # Step 3: Compute spatial turbulence for each calibration sample
+        cal_turbulence = []
+        for row in data:
+            cal_turbulence.append(self.compute_spatial_turbulence(row))
+
+        # Step 4: Compute moving variances across the calibration turbulence
+        #         series and store P95 threshold
+        cal_turbulence_arr = np.array(cal_turbulence)
+        mv_window = int(self.sample_rate * self.mvs_window_seconds)
+        mv_window = max(mv_window, 3)
+
+        moving_variances = []
+        for i in range(mv_window, len(cal_turbulence_arr) + 1):
+            segment = cal_turbulence_arr[i - mv_window:i]
+            moving_variances.append(float(np.var(segment)))
+
+        if len(moving_variances) > 0:
+            self.baseline_p95_mv = float(np.percentile(moving_variances, 95))
+        else:
+            self.baseline_p95_mv = 0.0
+
         self.calibrating = False
         self.calibrated = True
         self._calibration_amplitudes = []
+
+        # Log useful diagnostics
         logger.info(f"Calibration complete: {data.shape[0]} samples, "
-                    f"mean baseline variance = {np.mean(self.baseline_variance):.2f}")
+                    f"P95_mv = {self.baseline_p95_mv:.4f}, "
+                    f"selected {len(self._selected_subcarriers)} subcarriers")
 
     # ------------------------------------------------------------------
     # Detection result helper
@@ -401,14 +523,26 @@ class SignalProcessor:
     def get_detection_result(self) -> dict:
         """Return current detection state based on signal analysis.
 
+        The primary presence metric is now moving variance of spatial
+        turbulence compared against the P95 calibration threshold.
+        Variance ratio is retained for backward compatibility and debugging.
+
         Returns
         -------
         dict
             Keys: presence, movement, movement_label, variance_ratio,
+            spatial_turbulence, moving_variance, baseline_p95_mv,
             selected_subcarriers, calibrated, calibrating.
         """
         variance_ratio = self.compute_variance_ratio()
         movement = self.compute_movement_level()
+        moving_variance = self.compute_moving_variance()
+
+        # Latest spatial turbulence (from the turbulence buffer)
+        spatial_turbulence = (
+            self.turbulence_buffer[-1] if len(self.turbulence_buffer) > 0
+            else 0.0
+        )
 
         # Classify movement using configurable thresholds
         if movement < self.movement_quiet_threshold:
@@ -418,14 +552,20 @@ class SignalProcessor:
         else:
             movement_label = 'strong'
 
-        # Presence decision
-        presence = variance_ratio > 3.0 if self.calibrated else False
+        # Presence decision: use moving variance vs P95 threshold (primary)
+        if self.calibrated and self.baseline_p95_mv is not None:
+            presence = moving_variance > self.baseline_p95_mv
+        else:
+            presence = False
 
         return {
             'presence': presence,
             'movement': round(movement, 1),
             'movement_label': movement_label,
             'variance_ratio': round(variance_ratio, 3),
+            'spatial_turbulence': round(spatial_turbulence, 4),
+            'moving_variance': round(moving_variance, 6),
+            'baseline_p95_mv': round(self.baseline_p95_mv, 6) if self.baseline_p95_mv is not None else None,
             'selected_subcarriers': self.select_subcarriers(),
             'calibrated': self.calibrated,
             'calibrating': self.calibrating,
