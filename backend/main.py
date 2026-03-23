@@ -234,8 +234,30 @@ async def lifespan(app: FastAPI):
     else:
         logging.warning(f"ESP32 not found on {port} — will retry on API calls")
 
+    # Start traffic generator: ping ESP32 to generate CSI data
+    import subprocess
+    ping_proc = None
+    # Wait up to 10 seconds for ESP32 WiFi status to sync
+    for _ in range(20):
+        esp32_ip = reader.esp32_status.get('ip')
+        if esp32_ip:
+            break
+        await asyncio.sleep(0.5)
+    if esp32_ip:
+        logging.info(f"Starting CSI traffic generator: ping -i 0.02 {esp32_ip}")
+        ping_proc = subprocess.Popen(
+            ['ping', '-i', '0.02', esp32_ip],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        logging.warning("No ESP32 IP — traffic generator not started")
+
     yield
 
+    # Cleanup
+    if ping_proc:
+        ping_proc.terminate()
+        logging.info("Traffic generator stopped")
     reader.disconnect()
     logging.info("Backend shutdown complete")
 

@@ -21,8 +21,8 @@ csi:
 
 detection:
   threshold: 1.2            # legacy fallback
-  threshold_multiplier: 1.4
-  calibration_seconds: 30
+  threshold_multiplier: 1.1
+  calibration_seconds: 15
   num_subcarriers: 64
   sample_rate: 5
   buffer_seconds: 30
@@ -31,7 +31,7 @@ detection:
   movement_thresholds:
     quiet: 5
     light: 30
-  mac_filter: "auto"        # "auto" = use connected AP's BSSID, or specific MAC like "C4:93:BB:13:57:71"
+  mac_filter: "auto"  # "auto" = use connected AP's BSSID
 
 server:
   host: "0.0.0.0"
