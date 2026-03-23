@@ -2,8 +2,11 @@
 
 import { useESP32Status } from "@/hooks/useESP32Status";
 import { useCSIData, useCSIDataRaw } from "@/hooks/useCSIData";
+import { useDetection } from "@/hooks/useDetection";
 import { MetricsPanel } from "@/components/dashboard/MetricsPanel";
 import { CSIChart } from "@/components/dashboard/CSIChart";
+import { PresenceIndicator } from "@/components/dashboard/PresenceIndicator";
+import { MovementGauge } from "@/components/dashboard/MovementGauge";
 import { StatusBadge } from "@/components/wifi/StatusBadge";
 import Link from "next/link";
 
@@ -11,6 +14,7 @@ export default function DashboardPage() {
   const { status, connected, lastUpdated } = useESP32Status();
   const { packetsPerSecond, isReceiving } = useCSIData();
   const { subscribe } = useCSIDataRaw();
+  const detection = useDetection();
 
   const wifiState = status.wifi_connected
     ? "connected"
@@ -48,6 +52,71 @@ export default function DashboardPage() {
         <p className="text-sm text-text-secondary mt-0.5">
           Real-time CSI monitoring dashboard
         </p>
+      </div>
+
+      {/* Detection row — primary output */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+        <PresenceIndicator
+          presence={detection.presence}
+          varianceRatio={detection.varianceRatio}
+          calibrated={detection.calibrated}
+          calibrating={detection.calibrating}
+        />
+        <MovementGauge
+          movement={detection.movement}
+          movementLabel={detection.movementLabel}
+          calibrated={detection.calibrated}
+        />
+        {/* Key metrics summary card */}
+        <div className="rounded-xl border border-border/50 bg-bg-surface/30 p-5 backdrop-blur-sm flex flex-col justify-center min-h-[200px]">
+          <p className="text-[10px] text-text-secondary uppercase tracking-wider mb-3">
+            Key Metrics
+          </p>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-text-secondary">Packets/sec</span>
+              <span className="text-sm font-mono font-semibold text-text-primary">
+                {isReceiving ? packetsPerSecond : "--"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-text-secondary">RSSI</span>
+              <span className="text-sm font-mono font-semibold text-text-primary">
+                {status.rssi !== null ? `${status.rssi} dBm` : "--"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-text-secondary">Channel</span>
+              <span className="text-sm font-mono font-semibold text-text-primary">
+                {status.channel ?? "--"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-text-secondary">Calibrated</span>
+              <span
+                className={`text-sm font-medium ${
+                  detection.calibrated
+                    ? "text-emerald-400"
+                    : detection.calibrating
+                      ? "text-amber-400"
+                      : "text-text-secondary"
+                }`}
+              >
+                {detection.calibrated
+                  ? "Yes"
+                  : detection.calibrating
+                    ? "In Progress"
+                    : "No"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-text-secondary">Variance Ratio</span>
+              <span className="text-sm font-mono font-semibold text-text-primary">
+                {detection.calibrated ? detection.varianceRatio.toFixed(3) : "--"}
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Metrics row */}

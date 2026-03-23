@@ -24,6 +24,8 @@ export interface CSIData {
   channel: number;
   num_subcarriers: number;
   amplitudes: number[];
+  phases: number[];
+  raw_iq?: number[];
 }
 
 export interface DetectionResult {
