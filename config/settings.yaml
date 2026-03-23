@@ -20,8 +20,11 @@ csi:
   sample_rate_hz: 100   # target CSI packets per second
 
 detection:
-  presence_threshold: 3.0
+  threshold: 3.0
   calibration_seconds: 30
+  num_subcarriers: 64
+  sample_rate: 50
+  buffer_seconds: 10
   movement_thresholds:
     quiet: 5
     light: 30
